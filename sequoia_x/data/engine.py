@@ -245,10 +245,12 @@ class DataEngine:
                                 f"[{symbol}] 第{attempt + 1}次失败: {exc}，{wait}s 后重试"
                             )
                             time.sleep(wait)
-                            # 重连 baostock
+                            # 重连 baostock，失败则放弃当前股票
                             bs.logout()
-                            time.sleep(1)
-                            _login()
+                            time.sleep(2)
+                            if not _login():
+                                logger.warning(f"[{symbol}] 重连失败，跳过")
+                                break
                         else:
                             logger.warning(f"[{symbol}] {max_retries}次重试均失败，跳过")
 

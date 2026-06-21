@@ -13,7 +13,7 @@ load_dotenv()
 from datetime import date
 
 import socket
-socket.setdefaulttimeout(10.0)
+socket.setdefaulttimeout(30.0)
 
 from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger

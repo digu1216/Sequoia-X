@@ -36,3 +36,6 @@ build/
 
 # Hypothesis 测试缓存
 .hypothesis/
+
+# claude目录
+.claude

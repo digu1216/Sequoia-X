@@ -37,6 +37,23 @@ cp .env.example .env
 
 The `.env` file is gitignored. `DB_PATH` defaults to `data/sequoia_v2.db` (auto-created).
 
+### Python Interpreter
+
+This project uses the virtualenv at `.venv/` (uv-managed). Always invoke this
+interpreter rather than a system/global Python:
+
+```bash
+# Windows
+.venv/Scripts/python.exe <script.py>
+
+# macOS / Linux
+.venv/bin/python <script.py>
+```
+
+Install extra packages with `uv pip install <pkg>` (the venv has no standalone
+`pip`). Running scripts may require the project root on `PYTHONPATH` (or use a
+`sys.path` bootstrap, as `tests/test_backtest/backtest_limit_up_shakeout.py` does).
+
 ## Architecture
 
 ### Data Flow

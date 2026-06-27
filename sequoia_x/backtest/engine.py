@@ -10,6 +10,7 @@ from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.strategy.base import BaseStrategy
 
+from .buy_signal import BuySignal, OpenPriceEntry, PendingBuy, SkippedSignal
 from .config import BacktestConfig
 from .portfolio import Portfolio, Trade
 from .sell_signal import HoldNDays, SellSignal
@@ -53,15 +54,16 @@ class Backtester:
     """历史回测引擎。
 
     按时间轴逐日回放：
-      1. 执行上日信号在当日开盘买入（T+1）
+      1. 执行上日 pending_buys：由 BuySignal 协议决定是否成交 + 按什么价成交（T+1）
       2. 当日收盘检查卖出信号（止损/止盈/时间/自定义）
-      3. 生成当日信号供次日开盘使用
+      3. 生成当日信号 → 封装为 PendingBuy 队列，供次日 BuySignal 协议筛选
     """
 
     def __init__(
         self,
         data_engine: DataEngine,
         strategy_cls: type[BaseStrategy],
+        buy_signal: BuySignal | None = None,
         sell_signal: SellSignal | None = None,
         start: str = "2023-01-01",
         end: str = "2024-12-31",
@@ -70,6 +72,7 @@ class Backtester:
     ) -> None:
         self.data_engine = data_engine
         self.strategy_cls = strategy_cls
+        self._buy_signal = buy_signal
         self._sell_signal = sell_signal
         self.start = start
         self.end = end
@@ -117,24 +120,28 @@ class Backtester:
         else:
             sell_signal = HoldNDays(10)
 
+        # 买入信号优先级：显式传入 > 策略自定义 > 默认 OpenPriceEntry
+        if self._buy_signal is not None:
+            buy_signal: BuySignal = self._buy_signal
+        elif hasattr(strategy, "buy_signal") and callable(getattr(strategy, "buy_signal")):
+            buy_signal = strategy.buy_signal()
+        else:
+            buy_signal = OpenPriceEntry()
+
         portfolio = Portfolio(self.config)
         trades: list[Trade] = []
         equity_curve: list[tuple[str, float]] = []
-        pending_buys: list[str] = []
+        pending_buys: list[PendingBuy] = []
+        skipped_signals: list[SkippedSignal] = []
 
         # ── 4. 主回放循环
         for date in trading_days:
             sliced_engine.as_of = date
 
-            # 4a. 执行上日信号：次日开盘买入（T+1）
-            slots = self.config.max_positions - len(portfolio.positions)
-            for symbol in pending_buys[:slots]:
-                if symbol in portfolio.positions:
-                    continue
-                open_price = self._get_price(all_data, symbol, date, "open")
-                if open_price is None:
-                    continue
-                portfolio.open(symbol, date, open_price)
+            # 4a. 执行待买入队列：走 BuySignal 协议决定是否成交、按什么价成交
+            self._execute_pending_buys(
+                pending_buys, portfolio, all_data, date, buy_signal, skipped_signals
+            )
 
             # 4b. 获取当日收盘价（仅针对持仓股）
             close_prices = self._get_close_prices(all_data, portfolio.positions, date)
@@ -181,7 +188,9 @@ class Backtester:
                 trades.append(portfolio.close(symbol, last_date, close_price, "end_of_backtest"))
 
         logger.info(f"回测完成：{len(trades)} 笔交易，最终净值 {equity_curve[-1][1]:,.0f} 元" if equity_curve else "回测完成：无交易日数据")
-        return BacktestReport(trades, equity_curve, self.config)
+        return BacktestReport(
+            trades, equity_curve, self.config, skipped_signals=skipped_signals
+        )
 
     # ── 内部辅助方法 ────────────────────────────────────────────────────────
 
@@ -228,10 +237,84 @@ class Backtester:
                 prices[symbol] = price
         return prices
 
+    def _execute_pending_buys(
+        self,
+        pending_buys: list[PendingBuy],
+        portfolio: Portfolio,
+        all_data: dict[str, pd.DataFrame],
+        trade_date: str,
+        buy_signal: BuySignal,
+        skipped_signals: list[SkippedSignal],
+    ) -> None:
+        """T+1 开盘时刻，按 BuySignal 协议决定哪些 pending 单子真的成交、按什么价成交。
+
+        所有未成交的 PendingBuy 都会落到 skipped_signals 用于报告诊断；
+        队列结束后清空（未成交不滚动到下一日）。
+        """
+        slots = self.config.max_positions - len(portfolio.positions)
+        if not pending_buys:
+            return
+
+        if slots <= 0:
+            for pb in pending_buys:
+                skipped_signals.append(
+                    SkippedSignal(pb.symbol, pb.signal_date, trade_date, "no_slot")
+                )
+            pending_buys.clear()
+            return
+
+        executed = 0
+        for pb in pending_buys:
+            if executed >= slots:
+                skipped_signals.append(
+                    SkippedSignal(pb.symbol, pb.signal_date, trade_date, "no_slot")
+                )
+                continue
+
+            if pb.symbol in portfolio.positions:
+                skipped_signals.append(
+                    SkippedSignal(pb.symbol, pb.signal_date, trade_date, "already_held")
+                )
+                continue
+
+            next_bar = self._get_bar(all_data, pb.symbol, trade_date)
+            if next_bar is None:
+                skipped_signals.append(
+                    SkippedSignal(pb.symbol, pb.signal_date, trade_date, "no_bar")
+                )
+                continue
+
+            if not buy_signal.should_buy(
+                pb.symbol, pb.signal_date, pb.signal_bar, next_bar
+            ):
+                reason = buy_signal.rejection_reason(
+                    pb.symbol, pb.signal_date, pb.signal_bar, next_bar
+                )
+                skipped_signals.append(
+                    SkippedSignal(pb.symbol, pb.signal_date, trade_date, reason)
+                )
+                continue
+
+            price = buy_signal.entry_price(pb.signal_bar, next_bar)
+            if price is None or price <= 0:
+                skipped_signals.append(
+                    SkippedSignal(pb.symbol, pb.signal_date, trade_date, "price_none")
+                )
+                continue
+
+            if portfolio.open(pb.symbol, trade_date, price):
+                executed += 1
+            else:
+                skipped_signals.append(
+                    SkippedSignal(pb.symbol, pb.signal_date, trade_date, "cash_insufficient")
+                )
+
+        pending_buys.clear()
+
     def _filter_signals(
         self, signals: list[str], portfolio: Portfolio, all_data: dict, date: str
-    ) -> list[str]:
-        """过滤、排序、截断信号列表，返回次日可执行的买入队列。"""
+    ) -> list[PendingBuy]:
+        """过滤、排序、截断信号列表，返回次日可执行的 PendingBuy 队列。"""
         new = [s for s in signals if s not in portfolio.positions]
         slots = self.config.max_positions - len(portfolio.positions)
         if slots <= 0 or not new:
@@ -264,7 +347,15 @@ class Backtester:
                     return 0.0
             new.sort(key=mom_key, reverse=True)
 
-        return new[:slots]
+        truncated = new[:slots]
+
+        result: list[PendingBuy] = []
+        for sym in truncated:
+            bar = self._get_bar(all_data, sym, date)
+            if bar is None:
+                continue
+            result.append(PendingBuy(symbol=sym, signal_date=date, signal_bar=bar))
+        return result
 
 
 # 延迟导入，避免循环引用

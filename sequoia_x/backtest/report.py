@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
+from .buy_signal import SkippedSignal
 from .config import BacktestConfig
 from .portfolio import Trade
 
@@ -15,9 +16,11 @@ class BacktestReport:
         equity_curve: list[tuple[str, float]],
         config: BacktestConfig,
         benchmark: pd.Series | None = None,
+        skipped_signals: list[SkippedSignal] | None = None,
     ) -> None:
         self.trades = trades
         self.config = config
+        self.skipped_signals: list[SkippedSignal] = skipped_signals or []
 
         if equity_curve:
             dates, values = zip(*equity_curve)
@@ -28,6 +31,33 @@ class BacktestReport:
             self.equity_series = pd.Series(dtype=float)
 
         self._benchmark = benchmark
+
+    @property
+    def signal_fill_rate(self) -> float:
+        """信号成交率 = 已成交笔数 / (已成交 + 被过滤的信号)。"""
+        total = len(self.trades) + len(self.skipped_signals)
+        if total == 0:
+            return 0.0
+        return len(self.trades) / total
+
+    def skipped_summary(self) -> pd.DataFrame:
+        """按 skip reason 分组统计被过滤的买入信号数量。"""
+        if not self.skipped_signals:
+            return pd.DataFrame(columns=["reason", "count"])
+        df = pd.DataFrame(
+            [
+                {
+                    "symbol": s.symbol,
+                    "signal_date": s.signal_date,
+                    "skip_date": s.skip_date,
+                    "reason": s.reason,
+                }
+                for s in self.skipped_signals
+            ]
+        )
+        return df.groupby("reason").size().reset_index(name="count").sort_values(
+            "count", ascending=False
+        ).reset_index(drop=True)
 
     # ── 核心指标计算 ────────────────────────────────────────────────────────
 
@@ -135,6 +165,9 @@ class BacktestReport:
             "max_consec_losses": max_consec_loss,
             # 持仓统计
             "avg_position_ratio": avg_position_ratio,
+            # 信号执行
+            "skipped_count": len(self.skipped_signals),
+            "signal_fill_rate": self.signal_fill_rate,
         }
         return result
 
@@ -181,6 +214,9 @@ class BacktestReport:
         print(f"  {'最大连败':<18}{s['max_consec_losses']:>10}")
         print(line)
         print(f"  {'平均仓位使用率':<18}{s['avg_position_ratio']:>10.2%}")
+        if s["skipped_count"] > 0:
+            print(f"  {'信号成交率':<18}{s['signal_fill_rate']:>10.2%}")
+            print(f"  {'被过滤信号数':<18}{s['skipped_count']:>10}")
         print("=" * w)
 
     def to_dataframe(self) -> pd.DataFrame:

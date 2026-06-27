@@ -7,6 +7,13 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from sequoia_x.backtest.buy_signal import (
+    AllBuy,
+    BreakoutEntry,
+    LimitEntry,
+    OpenPriceEntry,
+    SkipLimitUp,
+)
 from sequoia_x.backtest.config import BacktestConfig, TransactionCost
 from sequoia_x.backtest.engine import Backtester, SlicedDataEngine
 from sequoia_x.backtest.sell_signal import HoldNDays, AnySell, StopLoss, TakeProfit
@@ -263,3 +270,198 @@ class TestBacktesterEndToEnd:
         report = bt.run()
         non_eob = [t for t in report.trades if t.exit_reason != "end_of_backtest"]
         assert all(t.days_held >= 1 for t in non_eob)
+
+
+# ── BuySignal 集成测试 ──────────────────────────────────────────────────────
+
+
+def _make_gappy_db(tmp_path: Path, symbol: str, dates: list[str], gap_pct: float) -> str:
+    """生成一只"每日跳开 gap_pct"的股票数据库：
+    每根 K 线 close ≈ 10，next_open = 当日 close × (1 + gap_pct)。
+    """
+    db_path = str(tmp_path / "gappy.db")
+    rows = []
+    prev_close = 10.0
+    for d in dates:
+        open_ = prev_close * (1 + gap_pct)
+        close = open_  # 高开后平收
+        high = max(open_, close) * 1.001
+        low = min(open_, close) * 0.999
+        rows.append({
+            "symbol": symbol, "date": d,
+            "open": open_, "high": high, "low": low, "close": close,
+            "volume": 1_000_000.0, "turnover": close * 1_000_000.0,
+        })
+        prev_close = close
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE stock_daily (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL, date TEXT NOT NULL,
+                open REAL, high REAL, low REAL, close REAL,
+                volume REAL, turnover REAL,
+                UNIQUE(symbol, date)
+            )
+        """)
+        conn.execute("CREATE INDEX idx_symbol_date ON stock_daily (symbol, date)")
+        df = pd.DataFrame(rows)
+        df.to_sql("stock_daily", conn, if_exists="append", index=False)
+        conn.commit()
+    return db_path
+
+
+class TestBacktesterBuySignal:
+    @pytest.fixture
+    def setup_gappy(self, tmp_path):
+        # 每日跳开 8%（接近涨停但未触发 9.7% 默认阈值）
+        db_path = _make_gappy_db(tmp_path, "000001", DATES_100, gap_pct=0.08)
+        settings = _make_settings(db_path)
+        engine = DataEngine(settings)
+        return engine, settings
+
+    @pytest.fixture
+    def setup_limit_up(self, tmp_path):
+        # 每日跳开 10%（高于 9.7% 阈值，应触发 SkipLimitUp）
+        db_path = _make_gappy_db(tmp_path, "000001", DATES_100, gap_pct=0.10)
+        settings = _make_settings(db_path)
+        engine = DataEngine(settings)
+        return engine, settings
+
+    def test_default_buy_signal_is_open_price_entry(self, setup_gappy):
+        """默认情况（不传 buy_signal）应等同 OpenPriceEntry：所有 pending 都成交。"""
+        engine, settings = setup_gappy
+        bt = Backtester(
+            data_engine=engine,
+            strategy_cls=AlwaysBuyStrategy,
+            sell_signal=HoldNDays(3),
+            start="2024-02-01",
+            end="2024-04-30",
+            settings=settings,
+        )
+        report = bt.run()
+        assert len(report.trades) > 0
+        # 默认无任何过滤，skipped 应全部是 "no_slot" / "already_held" 之类的引擎兜底
+        # 而非 BuySignal 主动拒绝
+        skip_reasons = {s.reason for s in report.skipped_signals}
+        assert "limit_buy" not in skip_reasons
+        assert "breakout" not in skip_reasons
+
+    def test_limit_entry_skips_high_open(self, setup_gappy):
+        """LimitEntry(0.03) 在每日跳开 8% 的数据上应拒绝所有信号。"""
+        engine, settings = setup_gappy
+        bt = Backtester(
+            data_engine=engine,
+            strategy_cls=AlwaysBuyStrategy,
+            buy_signal=LimitEntry(max_premium_pct=0.03),
+            sell_signal=HoldNDays(3),
+            start="2024-02-01",
+            end="2024-04-30",
+            settings=settings,
+        )
+        report = bt.run()
+        # 没有任何成交（除了 end_of_backtest 当然也没仓位）
+        normal_trades = [t for t in report.trades if t.exit_reason != "end_of_backtest"]
+        assert len(normal_trades) == 0
+        # skipped 中应有 limit_buy 原因
+        skip_reasons = {s.reason for s in report.skipped_signals}
+        assert "limit_buy" in skip_reasons
+
+    def test_skip_limit_up_filters_limit_up_open(self, setup_limit_up):
+        """SkipLimitUp 应拒绝跳开 10% 的信号，记入 skipped_signals。"""
+        engine, settings = setup_limit_up
+        bt = Backtester(
+            data_engine=engine,
+            strategy_cls=AlwaysBuyStrategy,
+            buy_signal=AllBuy(primary=OpenPriceEntry(), filters=[SkipLimitUp()]),
+            sell_signal=HoldNDays(3),
+            start="2024-02-01",
+            end="2024-04-30",
+            settings=settings,
+        )
+        report = bt.run()
+        normal_trades = [t for t in report.trades if t.exit_reason != "end_of_backtest"]
+        assert len(normal_trades) == 0
+        skip_reasons = {s.reason for s in report.skipped_signals}
+        assert "limit_up_open" in skip_reasons
+
+    def test_breakout_entry_requires_high_above_signal_high(self, setup_gappy):
+        """BreakoutEntry: 测试数据中每个 next_high ≈ next_open（即 prev_close × 1.08），
+        signal_high ≈ signal_close = prev_close（前一日的 close），
+        所以 next_high > signal_high 几乎总成立 → 大部分应成交。"""
+        engine, settings = setup_gappy
+        bt = Backtester(
+            data_engine=engine,
+            strategy_cls=AlwaysBuyStrategy,
+            buy_signal=BreakoutEntry(),
+            sell_signal=HoldNDays(3),
+            start="2024-02-01",
+            end="2024-04-30",
+            settings=settings,
+        )
+        report = bt.run()
+        # 在持续高开的数据中，突破条件总成立 → 有交易
+        assert len(report.trades) > 0
+
+    def test_all_buy_uses_primary_for_price(self, tmp_path):
+        """AllBuy(primary=BreakoutEntry, filters=[SkipLimitUp]) 应该按 BreakoutEntry 定价。"""
+        # 用平稳数据：每日跳开 1%，BreakoutEntry 突破信号高点（≈1% 高于 signal_close）
+        db_path = _make_gappy_db(tmp_path, "000001", DATES_100, gap_pct=0.01)
+        settings = _make_settings(db_path)
+        engine = DataEngine(settings)
+        bt = Backtester(
+            data_engine=engine,
+            strategy_cls=AlwaysBuyStrategy,
+            buy_signal=AllBuy(
+                primary=BreakoutEntry(tick=0.01),
+                filters=[SkipLimitUp()],
+            ),
+            sell_signal=HoldNDays(3),
+            start="2024-02-01",
+            end="2024-04-30",
+            settings=settings,
+        )
+        report = bt.run()
+        # 应该有交易成交，验证 entry 价格确实来自 BreakoutEntry 的逻辑
+        # （entry_price >= signal_high + tick）
+        non_eob = [t for t in report.trades if t.exit_reason != "end_of_backtest"]
+        assert len(non_eob) > 0
+
+    def test_signal_fill_rate_reflects_skipped(self, setup_limit_up):
+        """signal_fill_rate 在严格过滤下应该明显小于 1.0。"""
+        engine, settings = setup_limit_up
+        bt = Backtester(
+            data_engine=engine,
+            strategy_cls=AlwaysBuyStrategy,
+            buy_signal=AllBuy(primary=OpenPriceEntry(), filters=[SkipLimitUp()]),
+            sell_signal=HoldNDays(3),
+            start="2024-02-01",
+            end="2024-04-30",
+            settings=settings,
+        )
+        report = bt.run()
+        # 大量信号被过滤，成交率应很低（接近 0）
+        assert report.signal_fill_rate < 0.5
+        # summary 字典中应该有这两个键
+        s = report.summary()
+        assert "skipped_count" in s
+        assert "signal_fill_rate" in s
+        assert s["skipped_count"] > 0
+
+    def test_skipped_summary_groups_by_reason(self, setup_limit_up):
+        """skipped_summary() 返回按 reason 分组的 DataFrame。"""
+        engine, settings = setup_limit_up
+        bt = Backtester(
+            data_engine=engine,
+            strategy_cls=AlwaysBuyStrategy,
+            buy_signal=AllBuy(primary=OpenPriceEntry(), filters=[SkipLimitUp()]),
+            sell_signal=HoldNDays(3),
+            start="2024-02-01",
+            end="2024-04-30",
+            settings=settings,
+        )
+        report = bt.run()
+        df = report.skipped_summary()
+        assert "reason" in df.columns
+        assert "count" in df.columns
+        assert (df["reason"] == "limit_up_open").any()

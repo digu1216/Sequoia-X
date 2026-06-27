@@ -1,6 +1,6 @@
 # Sequoia-X 回测模块设计文档
 
-> 版本：v0.1 | 日期：2026-06-21
+> 版本：v0.2 | 日期：2026-06-27（v0.2 新增可插拔 BuySignal 协议）
 
 ---
 
@@ -15,15 +15,19 @@
 ```
 每个交易日 D（历史回放）：
   1. 策略收到截止 D 日的 OHLCV 数据 → 输出买入信号（股票列表）
-  2. D+1 开盘价买入（模拟次日挂单成交）
-  3. 每日检查持仓是否触发卖出信号（止损/止盈/时间/自定义）
-  4. 触发则以当日收盘价卖出
-  5. 记录交易、更新净值
+  2. 信号入队 PendingBuy（携带 D 日 signal_bar）
+  3. D+1 开盘后由 BuySignal 协议决定：是否成交 + 按什么价成交
+       · 默认 OpenPriceEntry：次日开盘价直接买入（向后兼容）
+       · 可自定义：LimitEntry 限价、BreakoutEntry 突破确认、SkipLimitUp 涨停过滤等
+  4. 每日检查持仓是否触发卖出信号（止损/止盈/时间/自定义）
+  5. 触发则以当日收盘价卖出
+  6. 记录交易、更新净值；被过滤的买入信号落入 BacktestReport.skipped_signals
 ```
 
 ### 1.3 设计原则
 
 - **零未来函数**：策略在日期 D 只能看到 `date <= D` 的数据
+- **可插拔买入信号**：入场条件与价格逻辑解耦，可组合（v0.2 新增）
 - **可插拔卖出信号**：卖出逻辑与买入策略解耦，可自由组合
 - **A股真实成本**：内置佣金、印花税、滑点
 - **与现有架构最小耦合**：复用 `DataEngine.get_ohlcv()`，不改动现有策略代码
@@ -37,6 +41,7 @@ sequoia_x/
 └── backtest/
     ├── __init__.py
     ├── config.py          # BacktestConfig、TransactionCost 数据类
+    ├── buy_signal.py      # BuySignal 抽象类及内置实现（v0.2 新增）
     ├── sell_signal.py     # SellSignal 抽象类及内置实现
     ├── portfolio.py       # Portfolio：持仓管理、交易记录
     ├── engine.py          # Backtester：主回测引擎
@@ -47,6 +52,7 @@ docs/
 
 tests/
 └── test_backtest/
+    ├── test_buy_signal.py
     ├── test_sell_signal.py
     ├── test_portfolio.py
     └── test_engine.py
@@ -148,6 +154,95 @@ class BaseStrategy(ABC):
 
 ---
 
+### 3.2.5 BuySignal（`buy_signal.py`）— v0.2 新增
+
+与 SellSignal 对称：将"如何入场"从引擎硬编码中分离，变成可插拔协议。
+策略在 D 日产生候选股票后，BuySignal 决定 (a) 这笔信号是否真的成交、(b) 按什么价成交。
+
+#### 抽象基类
+
+```python
+class BuySignal(ABC):
+    reason: str = "buy_signal"
+
+    @abstractmethod
+    def should_buy(
+        self,
+        symbol:      str,
+        signal_date: str,
+        signal_bar:  pd.Series,   # D 日 OHLCV（信号产生当日）
+        next_bar:    pd.Series,   # D+1 日 OHLCV（计划成交当日）
+    ) -> bool: ...
+
+    @abstractmethod
+    def entry_price(
+        self,
+        signal_bar: pd.Series,
+        next_bar:   pd.Series,
+    ) -> float | None: ...        # None 表示放弃这笔
+```
+
+#### 内置实现
+
+| 类名 | 含义 | 关键参数 |
+|---|---|---|
+| `OpenPriceEntry` | **默认**：次日开盘价直接买入 | — |
+| `LimitEntry` | 次日开盘溢价 ≤ `max_premium_pct` 才买 | `max_premium_pct: float = 0.03` |
+| `BreakoutEntry` | 次日 high > D 日 high 才入场，按 `signal_high + tick` 成交 | `tick: float = 0.01` |
+| `SkipLimitUp` | **过滤器**：次日开盘涨幅 ≥ threshold 时拒绝 | `threshold: float = 0.097` |
+| `AnyBuy(*signals)` | OR 组合，first-match-wins 定价 | 子信号列表 |
+| `AllBuy(primary, filters)` | AND 组合，**显式 primary 定价 + filters 仅过滤** | `primary`, `filters` |
+
+#### BuyFilter 抽象子类
+
+```python
+class BuyFilter(BuySignal):
+    """过滤器基类：entry_price 强制返回 None，确保不能用作 AllBuy 的 primary。"""
+    def entry_price(self, signal_bar, next_bar) -> None: ...
+```
+
+`SkipLimitUp` 是 `BuyFilter` 的内置实现；用户自定义过滤器只需继承 `BuyFilter` 并实现 `should_buy()`。
+
+#### 典型组合示例
+
+```python
+# 突破确认 + 涨停过滤 + 限价兜底
+buy = AllBuy(
+    primary=BreakoutEntry(tick=0.01),
+    filters=[SkipLimitUp(), LimitEntry(max_premium_pct=0.05)],
+)
+```
+
+**注意**：`LimitEntry` 不是 `BuyFilter` 子类，因为它本身可以独立用作 primary（提供开盘价）；
+若希望它仅作为过滤器使用，需用 `AllBuy(primary=OpenPriceEntry(), filters=[...])` 这样的结构。
+
+#### 策略自定义入场（可选扩展）
+
+`BaseStrategy` 可以选择性覆盖 `buy_signal()` 方法：
+
+```python
+class BaseStrategy(ABC):
+    def run(self) -> list[str]: ...           # 现有方法，不变
+
+    def buy_signal(self) -> BuySignal:        # 可选，默认 OpenPriceEntry
+        return OpenPriceEntry()
+```
+
+**优先级链**：`Backtester(buy_signal=...)` 显式传入 > `strategy.buy_signal()` 方法 > 默认 `OpenPriceEntry()`
+
+#### 拒绝原因与诊断
+
+被 BuySignal 拒绝的信号会落入 `BacktestReport.skipped_signals`，可通过：
+
+- `report.skipped_summary()` — 按原因分组的 DataFrame
+- `report.signal_fill_rate` — 信号成交率（已成交/已成交+被过滤）
+- `report.summary()["skipped_count"]` / `["signal_fill_rate"]`
+
+`AllBuy` 的 `rejection_reason()` 会精确定位到具体拒绝的子信号（primary 还是某个 filter），
+便于回答"我的信号为什么没成交"。
+
+---
+
 ### 3.3 Portfolio（`portfolio.py`）
 
 维护持仓状态与交易记录，是回测引擎的账本。
@@ -228,6 +323,7 @@ class Backtester:
         self,
         data_engine:  DataEngine,
         strategy_cls: type[BaseStrategy],    # 策略类（非实例）
+        buy_signal:   BuySignal | None,      # v0.2 新增；None 则用 OpenPriceEntry
         sell_signal:  SellSignal | None,     # None 则使用策略默认
         start:        str,                   # "YYYY-MM-DD"
         end:          str,
@@ -252,6 +348,10 @@ def run(self) -> BacktestReport:
     for date in self._trading_days:
         sliced_engine.as_of = date           # 切换数据视角到当日
 
+        # ── 开盘阶段：执行 pending_buys（经 BuySignal 协议筛选）──
+        self._execute_pending_buys(pending_buys, portfolio, all_data,
+                                    date, buy_signal, skipped_signals)
+
         # ── 收盘阶段：检查卖出信号 ──
         current_prices = self._get_close_prices(date)
         portfolio.update_peaks(date, current_prices)
@@ -265,10 +365,8 @@ def run(self) -> BacktestReport:
 
         # ── 信号阶段：生成次日买入信号 ──
         signals = strategy.run()             # 策略只能看 date 及之前的数据
-        new_signals = self._filter_signals(signals)  # 去重、排序、截断
-
-        # ── 次日开盘买入（记入 pending，下一个 date 执行）──
-        pending_buys = new_signals
+        # _filter_signals 返回 list[PendingBuy]（携带 D 日 signal_bar）
+        pending_buys = self._filter_signals(signals, portfolio, all_data, date)
 
         # ── 记录当日净值快照 ──
         equity_curve.append((date, portfolio.equity))
@@ -304,16 +402,20 @@ class SlicedDataEngine:
 class BacktestReport:
     def __init__(
         self,
-        trades:       list[Trade],
-        equity_curve: list[tuple[str, float]],   # [(date, equity), ...]
-        config:       BacktestConfig,
-        benchmark:    pd.Series | None = None,   # 基准净值序列（如 HS300）
+        trades:          list[Trade],
+        equity_curve:    list[tuple[str, float]],         # [(date, equity), ...]
+        config:          BacktestConfig,
+        benchmark:       pd.Series | None = None,         # 基准净值序列（如 HS300）
+        skipped_signals: list[SkippedSignal] | None = None,  # v0.2 新增
     ): ...
 
     def summary(self) -> dict                    # 返回核心指标字典
     def print(self) -> None                      # 格式化打印到控制台
     def to_dataframe(self) -> pd.DataFrame       # 逐笔交易明细
-    def plot(self) -> None                       # 资金曲线图（需 matplotlib）
+    def skipped_summary(self) -> pd.DataFrame    # 按 reason 分组的过滤诊断（v0.2）
+
+    @property
+    def signal_fill_rate(self) -> float          # 信号成交率（v0.2）
 ```
 
 ---
@@ -369,11 +471,12 @@ class BacktestReport:
 
 ### 4.5 信号与持仓类
 
-| 指标 | 说明 |
-|---|---|
-| 平均每日信号数 | 策略每天平均产生多少买入信号 |
-| 信号实际执行率 | 因仓位/现金限制被丢弃的信号比例 |
-| 最大并发持仓 | 任意时刻的最大同时持仓数 |
+| 指标 | 说明 | 字段名 |
+|---|---|---|
+| 平均每日信号数 | 策略每天平均产生多少买入信号 | — |
+| **信号成交率** | 已成交笔数 / (已成交 + 被过滤) | `signal_fill_rate` |
+| **被过滤信号数** | BuySignal 协议拒绝 + 仓位/现金等引擎兜底过滤的总数 | `skipped_count` |
+| 最大并发持仓 | 任意时刻的最大同时持仓数 | — |
 | 平均仓位使用率 | 持仓市值 / 总资产 的均值 |
 
 ---
@@ -383,6 +486,7 @@ class BacktestReport:
 ### 5.1 开仓决策流程
 
 ```
+[D 日收盘后]
 当日信号 [S1, S2, ..., Sn]
     ↓
 过滤已持仓股票
@@ -391,9 +495,19 @@ class BacktestReport:
     ↓
 超额时按 signal_priority 排序，取前 N 个
     ↓
+封装为 PendingBuy（携带 D 日 signal_bar）
+    ↓
+─────────── 跨日 ───────────
+    ↓
+[D+1 日开盘]
+逐个 PendingBuy 走 BuySignal 协议：
+  · buy_signal.should_buy(symbol, signal_date, signal_bar, next_bar) → 是否成交？
+  · buy_signal.entry_price(signal_bar, next_bar)                     → 按什么价？
+  · 被拒绝的进入 skipped_signals（供报告诊断）
+    ↓
 逐一检查现金是否充足（可用现金 >= position_size × total_equity）
     ↓
-次日开盘价成交，扣除佣金 + 滑点
+Portfolio.open() 内部加滑点 + 佣金成交
 ```
 
 ### 5.2 T+1 约束
@@ -489,6 +603,29 @@ for name, r in reports.items():
     print(f"{name}: 年化={s['annualized_return']:.1%}, 夏普={s['sharpe']:.2f}, MDD={s['max_drawdown']:.1%}")
 ```
 
+### 6.4 自定义买入信号（v0.2）
+
+```python
+from sequoia_x.backtest import (
+    AllBuy, BreakoutEntry, SkipLimitUp, LimitEntry, OpenPriceEntry,
+)
+
+# 突破确认 + 涨停过滤
+report = Backtester(
+    data_engine=engine,
+    strategy_cls=TurtleTradeStrategy,
+    buy_signal=AllBuy(
+        primary=BreakoutEntry(tick=0.01),
+        filters=[SkipLimitUp()],
+    ),
+    sell_signal=AnySell(StopLoss(0.05), HoldNDays(20)),
+    start="2024-01-01", end="2024-12-31",
+).run()
+
+print(f"信号成交率: {report.signal_fill_rate:.2%}")
+print(report.skipped_summary())
+```
+
 ---
 
 ## 7. 扩展点
@@ -496,7 +633,9 @@ for name, r in reports.items():
 | 扩展场景 | 实现方式 |
 |---|---|
 | 新卖出信号 | 继承 `SellSignal`，实现 `should_sell()` |
-| 策略专属卖出逻辑 | 在策略类中覆盖 `sell_signal()` 方法 |
+| 新买入信号（出价型） | 继承 `BuySignal`，实现 `should_buy()` + `entry_price()` |
+| 新买入过滤器（仅过滤） | 继承 `BuyFilter`，只需实现 `should_buy()`（`entry_price` 自动为 None）|
+| 策略专属买入/卖出逻辑 | 在策略类中覆盖 `buy_signal()` / `sell_signal()` 方法 |
 | 对比基准（沪深300） | 向 `BacktestReport` 传入 `benchmark` 序列 |
 | 分行业 / 分市值统计 | 在 `BacktestReport` 中扩展 `breakdown()` 方法 |
 | 参数扫描（网格搜索） | 在 `BacktestConfig` 上循环，复用 `Backtester` |
@@ -507,10 +646,12 @@ for name, r in reports.items():
 ## 8. 关键约束与限制
 
 1. **数据依赖**：回测依赖本地 SQLite 历史数据，需先完成 `--backfill`
-2. **涨停无法买入**：当前模型不处理涨停无法成交的情况；可在开仓时检查 `(open == high) and (pct_change >= 0.099)` 来过滤
+2. **涨停过滤**：内置 `SkipLimitUp` 过滤器可以拒绝涨停跳开的信号；默认未启用，需用户显式组合（v0.2 起）
 3. **复权方式**：使用后复权价格（`adjustflag="1"`），回测收益率已隐含除权影响
 4. **并发安全**：`SlicedDataEngine` 是只读的，多策略并行回测时可共享 `all_data` 字典
 5. **内存**：预加载 ~5200 只股票的完整历史约占 1-2 GB RAM，可按需改为懒加载
+6. **未成交信号不滚动**：BuySignal 拒绝的 PendingBuy 直接丢弃，不会顺延到下一日（与改造前隐式行为一致）。
+   未来若需要"挂单等待"语义，可引入 `OrderQueue` 跨日机制
 
 ---
 
